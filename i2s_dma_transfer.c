@@ -22,6 +22,8 @@
 #include "fsl_codec_common.h"
 #include "music.h"
 
+#include "tone.h"
+
 #include <stdbool.h>
 #include "fsl_codec_adapter.h"
 #include "fsl_cs42448.h"
@@ -29,15 +31,23 @@
  * Definitions
  ******************************************************************************/
 #define DEMO_I2S_MASTER_CLOCK_FREQUENCY CLOCK_GetMclkClkFreq()
-#define DEMO_AUDIO_BIT_WIDTH            (16)
+// For some reason, the only bit width that the driver can handle is 24 even though
+// specs say 16, 18, 20 and 24 (p 34)
+#define DEMO_AUDIO_BIT_WIDTH            (24)
+// In TDM mode, there are 32 clicks per sample, regardless of bitwidth
+#define DEMO_AUDIO_TICKS_PER_SAMPLE     (32)
 #define DEMO_AUDIO_SAMPLE_RATE          (48000)
+#define DEMO_NUM_AUDIO_CH               (8)
 #define DEMO_AUDIO_PROTOCOL             kCODEC_BusI2S
 #define DEMO_I2S_TX                     (I2S3)
 #define DEMO_DMA                        (DMA0)
 #define DEMO_I2S_TX_CHANNEL             (7)
-#define DEMO_I2S_CLOCK_DIVIDER          16
+// The bit rate required for I2S is the sampling rate (48k) multiplied by the number of bits per sample (32 required) multiplied by the number of
+// channels (in this case 8).  To get this value, we need to divide the master clock down by this amount.
+#define DEMO_I2S_CLOCK_DIVIDER          DEMO_I2S_MASTER_CLOCK_FREQUENCY / DEMO_AUDIO_SAMPLE_RATE / DEMO_AUDIO_TICKS_PER_SAMPLE / DEMO_NUM_AUDIO_CH
 #define DEMO_I2S_TX_MODE                kI2S_MasterSlaveNormalMaster
 #define DEMO_CODEC_VOLUME               100U
+#define DEMO_TDM_DATA_START_POSITION    1U
 #ifndef DEMO_CODEC_VOLUME
 #define DEMO_CODEC_VOLUME 30U
 #endif
@@ -58,8 +68,8 @@ cs42448_config_t cs42448Config = {
     .reset        = NULL,
     .master       = false,
     .i2cConfig    = {.codecI2CInstance = BOARD_CODEC_I2C_INSTANCE},
-    .format       = {.sampleRate = 48000U, .bitWidth = 16U},
-    .bus          = kCS42448_BusI2S,
+    .format       = {.sampleRate = 48000U, .bitWidth = 24U},
+    .bus          = kCS42448_BusTDM,
     .slaveAddress = CS42448_I2C_ADDR,
 };
 
@@ -72,6 +82,8 @@ static i2s_transfer_t s_TxTransfer;
 extern codec_config_t boardCodecConfig;
 codec_handle_t codecHandle;
 
+uint8_t *buffer = {0};
+uint16_t xfer_size = 0;
 /*******************************************************************************
  * Code
  ******************************************************************************/
@@ -90,9 +102,8 @@ int main(void)
     /* I2C */
     CLOCK_AttachClk(kFFRO_to_FLEXCOMM2);
 
-    /* attach AUDIO PLL clock to FLEXCOMM1 (I2S1) */
-    CLOCK_AttachClk(kAUDIO_PLL_to_FLEXCOMM1);
     /* attach AUDIO PLL clock to FLEXCOMM3 (I2S3) */
+    // Flexcomm 3 is used by the codec...
     CLOCK_AttachClk(kAUDIO_PLL_to_FLEXCOMM3);
 
     /* attach AUDIO PLL clock to MCLK */
@@ -101,19 +112,28 @@ int main(void)
     SYSCTL1->MCLKPINDIR = SYSCTL1_MCLKPINDIR_MCLKPINDIR_MASK;
 
     cs42448Config.i2cConfig.codecI2CSourceClock = CLOCK_GetFlexCommClkFreq(2);
-    cs42448Config.format.mclk_HZ                = CLOCK_GetMclkClkFreq();
+    cs42448Config.format.mclk_HZ                = DEMO_I2S_MASTER_CLOCK_FREQUENCY;
 
     PRINTF("Configure codec\r\n");
+    uint8_t reg_val = 0;
 
-    /* protocol: i2s
-     * sampleRate: 48K
-     * bitwidth:16
-     */
     if (CODEC_Init(&codecHandle, &boardCodecConfig) != kStatus_Success)
     {
         PRINTF("codec_Init failed!\r\n");
         assert(false);
     }
+    CS42448_ReadReg((cs42448_handle_t *)((uint32_t)(codecHandle.codecDevHandle)), CS42448_POWER_CONTROL, &reg_val);
+
+    // Turn everything off excpet the headphone jack
+    uint8_t pdn_down = kCS42448_ModuleDACPair2 | kCS42448_ModuleDACPair3 | kCS42448_ModuleDACPair4 |
+                        kCS42448_ModuleADCPair1 | kCS42448_ModuleADCPair2 | kCS42448_ModuleADCPair3;
+    // status_t error_val = CS42448_SetModule((cs42448_handle_t *)((uint32_t)(codecHandle.codecDevHandle)), pdn_down, true);
+    CS42448_ReadReg((cs42448_handle_t *)((uint32_t)(codecHandle.codecDevHandle)), CS42448_POWER_CONTROL, &reg_val);
+    // if (error_val)
+    // {
+    //     PRINTF("Attempt to turn off power domains failed with %d", error_val);
+    //     assert(false);
+    // }
 
     /* Initial volume kept low for hearing safety.
      * Adjust it to your needs, 0-100, 0 for mute, 100 for maximum volume.
@@ -123,6 +143,8 @@ int main(void)
     {
         assert(false);
     }
+
+    initialize_wave(DEMO_AUDIO_SAMPLE_RATE, 1000, 10000, B16);
 
     PRINTF("Configure I2S\r\n");
 
@@ -145,9 +167,19 @@ int main(void)
      */
     I2S_TxGetDefaultConfig(&s_TxConfig);
     s_TxConfig.divider     = DEMO_I2S_CLOCK_DIVIDER;
-    s_TxConfig.masterSlave = DEMO_I2S_TX_MODE;
+    s_TxConfig.mode        = kI2S_ModeDspWsShort;
+    s_TxConfig.wsPol       = true;
+    // This value is fixed for the codec
+    s_TxConfig.dataLength  = 32U;
+    // Fix at 8 channels
+    s_TxConfig.frameLength = 32U * 8U;
+    s_TxConfig.position    = 1U;
+
 
     I2S_TxInit(DEMO_I2S_TX, &s_TxConfig);
+    I2S_EnableSecondaryChannel(DEMO_I2S_TX, kI2S_SecondaryChannel1, false, 64+DEMO_TDM_DATA_START_POSITION);
+    I2S_EnableSecondaryChannel(DEMO_I2S_TX, kI2S_SecondaryChannel2, false, 128+DEMO_TDM_DATA_START_POSITION);
+    I2S_EnableSecondaryChannel(DEMO_I2S_TX, kI2S_SecondaryChannel3, false, 192+DEMO_TDM_DATA_START_POSITION);
 
     DMA_Init(DEMO_DMA);
 
@@ -155,30 +187,43 @@ int main(void)
     DMA_SetChannelPriority(DEMO_DMA, DEMO_I2S_TX_CHANNEL, kDMA_ChannelPriority3);
     DMA_CreateHandle(&s_DmaTxHandle, DEMO_DMA, DEMO_I2S_TX_CHANNEL);
 
+    buffer = (uint8_t *)populate_buffer(&xfer_size);
+    xfer_size *=4;
+
     StartSoundPlayback();
 
     while (1)
     {
     }
+
+    return 0;
 }
 
 static void StartSoundPlayback(void)
 {
     PRINTF("Setup looping playback of sine wave\r\n");
 
-    s_TxTransfer.data     = &g_Music[0];
-    s_TxTransfer.dataSize = sizeof(g_Music);
+    s_TxTransfer.data     = buffer;
+    s_TxTransfer.dataSize = (size_t)xfer_size;
 
-    I2S_TxTransferCreateHandleDMA(DEMO_I2S_TX, &s_TxHandle, &s_DmaTxHandle, TxCallback, (void *)&s_TxTransfer);
+    I2S_TxTransferCreateHandleDMA(DEMO_I2S_TX, &s_TxHandle, &s_DmaTxHandle, TxCallback, NULL);
     /* need to queue two transmit buffers so when the first one
      * finishes transfer, the other immediatelly starts */
     I2S_TxTransferSendDMA(DEMO_I2S_TX, &s_TxHandle, s_TxTransfer);
+
+    buffer = (uint8_t *)populate_buffer(&xfer_size);
+
     I2S_TxTransferSendDMA(DEMO_I2S_TX, &s_TxHandle, s_TxTransfer);
+    buffer = (uint8_t *)populate_buffer(&xfer_size);
+
 }
 
 static void TxCallback(I2S_Type *base, i2s_dma_handle_t *handle, status_t completionStatus, void *userData)
 {
     /* Enqueue the same original buffer all over again */
-    i2s_transfer_t *transfer = (i2s_transfer_t *)userData;
-    I2S_TxTransferSendDMA(base, handle, *transfer);
+    s_TxTransfer.data     = buffer;
+    s_TxTransfer.dataSize = (size_t)xfer_size*4;
+
+    I2S_TxTransferSendDMA(base, handle, s_TxTransfer);
+    buffer = (uint8_t *)populate_buffer(&xfer_size);
 }

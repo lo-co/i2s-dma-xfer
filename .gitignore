@@ -53,6 +53,7 @@ dkms.conf
 
 # VS Code ws
 .vscode/
+*.code-workspace
 
 # NXP stuff
 __repo__/

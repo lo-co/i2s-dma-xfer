@@ -1,3 +1,5 @@
+This is an example that is for the RT685S-AUD-EVK board.  The current environment is VS Code.
+
 Overview
 ========
 

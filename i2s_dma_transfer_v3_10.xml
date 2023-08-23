@@ -146,7 +146,12 @@
     <source path="." project_relative_path="board" type="c_include">
       <files mask="pin_mux.h"/>
     </source>
-    <source path="../../../../../core/boards/mimxrt685audevk" project_relative_path="board" type="src">
+    <source path="." project_relative_path="board" type="src">
+      <files mask="tone.c"/>
+    </source>
+    <source path="." project_relative_path="board" type="c_include">
+      <files mask="tone.h"/>
+    </source>    <source path="../../../../../core/boards/mimxrt685audevk" project_relative_path="board" type="src">
       <files mask="board.c"/>
       <files mask="clock_config.c"/>
     </source>
